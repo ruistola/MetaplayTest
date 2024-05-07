@@ -4,6 +4,7 @@ namespace Game.Logic
 {
     public interface IPlayerModelServerListener
     {
+        void ServerMakeNumberGoUp();
     }
 
     public interface IPlayerModelClientListener
@@ -13,6 +14,8 @@ namespace Game.Logic
     public class EmptyPlayerModelServerListener : IPlayerModelServerListener
     {
         public static readonly EmptyPlayerModelServerListener Instance = new EmptyPlayerModelServerListener();
+
+        public void ServerMakeNumberGoUp() {}
     }
 
     public class EmptyPlayerModelClientListener : IPlayerModelClientListener

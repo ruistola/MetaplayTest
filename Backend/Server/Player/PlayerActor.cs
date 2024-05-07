@@ -33,5 +33,10 @@ namespace Game.Server.Player
         {
             model.ServerListener = this;
         }
+
+        public void ServerMakeNumberGoUp()
+        {
+            EnqueueServerAction(new ServerMakeNumberGoUp());
+        }
     }
 }
