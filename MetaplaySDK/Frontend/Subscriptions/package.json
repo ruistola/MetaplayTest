@@ -1,0 +1,23 @@
+{
+  "name": "@metaplay/subscriptions",
+  "version": "1.0.0",
+  "description": "Re-usable subscription system for Vue components to fetch and cache data from the game server API.",
+  "main": "src/index.ts",
+  "type": "module",
+  "dependencies": {
+    "@metaplay/typescript-config": "workspace:^",
+    "@metaplay/eslint-config": "workspace:^",
+    "axios": "^1.6.0",
+    "luxon": "^3.4.3",
+    "vue": "^3.4.19",
+    "@vue/compat": "^3.4.19"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "devDependencies": {
+    "@types/lodash-es": "^4.17.12",
+    "@types/luxon": "^3.4.1",
+    "lodash-es": "^4.17.21",
+    "typescript": "5.1.6"
+  }
+}

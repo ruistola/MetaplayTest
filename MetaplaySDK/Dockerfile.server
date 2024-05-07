@@ -1,0 +1,215 @@
+#----------------------------------------------------------------------
+# Global build arguments
+#----------------------------------------------------------------------
+
+# Directory where MetaplaySDK is located, relative to invocation directory
+ARG SDK_ROOT=MetaplaySDK
+# Directory where the project root is, relative to the invocation directory
+ARG PROJECT_ROOT=.
+# Userland Backend directory, relative to PROJECT_ROOT
+ARG BACKEND_DIR=Backend
+# Userland Dashboard directory, relative to PROJECT_ROOT
+ARG DASHBOARD_DIR=$BACKEND_DIR/Dashboard
+# Directory where shared code is located, relative to PROJECT_ROOT
+ARG SHARED_CODE_DIR=Assets/SharedCode
+# Directory for (low-stakes) server secrets, relative to the invocation directory
+ARG SERVER_SECRETS_DIR=$PROJECT_ROOT/$BACKEND_DIR/Server/Secrets
+# Directory for server game configs, relative to the invocation directory
+ARG SERVER_GAME_CONFIG_DIR=$PROJECT_ROOT/$BACKEND_DIR/Server/GameConfig
+# Directory for pnpm project root. This is where pnpm lockfile and workspace are located.
+ARG PNPM_ROOT=.
+# Set to 1 for integration test builds. Installs Cypress dependencies and runs additional tests when enabled.
+ARG RUN_TESTS=0
+# Base .NET version. To build using .NET 7, set the version to '7.0'.
+ARG DOTNET_VERSION=8.0
+
+#----------------------------------------------------------------------
+# Build the game server and botclient C# projects
+#----------------------------------------------------------------------
+
+# Available versions in: https://hub.docker.com/_/microsoft-dotnet-sdk
+# \note Always using the latest SDK version for building (it can target previous frameworks too, but cannot run the binaries).
+#       See https://github.com/dotnet/sdk/issues/10190 for details on why this must be done like this.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:8.0 AS build-dotnet
+
+# Build arguments
+ARG BUILD_NUMBER=none
+ARG COMMIT_ID=none
+ARG SDK_ROOT
+ARG PROJECT_ROOT
+ARG BACKEND_DIR
+ARG SHARED_CODE_DIR
+ARG RUN_TESTS
+ARG DOTNET_VERSION
+ARG SERVER_GAME_CONFIG_DIR
+
+ENV SDK_ROOT=$SDK_ROOT
+ENV RUN_TESTS=$RUN_TESTS
+
+# Install diagnostics tools (installation requires SDK, copied into runtime image)
+RUN dotnet tool install --global dotnet-counters && \
+    dotnet tool install --global dotnet-trace && \
+    dotnet tool install --global dotnet-dump && \
+    dotnet tool install --global dotnet-gcdump
+ENV PATH="/root/.dotnet/tools:${PATH}"
+
+# Copy files
+COPY $SDK_ROOT/.editorconfig /build/$SDK_ROOT/.editorconfig
+COPY $SDK_ROOT/Backend /build/$SDK_ROOT/Backend
+COPY $SDK_ROOT/Client /build/$SDK_ROOT/Client
+COPY $SDK_ROOT/Scripts /build/$SDK_ROOT/Scripts
+COPY $PROJECT_ROOT/$BACKEND_DIR /build/$PROJECT_ROOT/$BACKEND_DIR
+COPY $PROJECT_ROOT/$SHARED_CODE_DIR /build/$PROJECT_ROOT/$SHARED_CODE_DIR
+
+# Restore dependencies (before splitting into multiple build contexts)
+RUN --mount=type=cache,id=nuget-cache,target=/root/.nuget/packages \
+    dotnet restore /build/$PROJECT_ROOT/$BACKEND_DIR/Server && \
+    dotnet restore /build/$PROJECT_ROOT/$BACKEND_DIR/BotClient
+
+# Inject build number and commit id
+RUN /bin/bash /build/$SDK_ROOT/Scripts/update-cloudcore-versions.sh ${BUILD_NUMBER} ${COMMIT_ID} /build/$SDK_ROOT/Backend/Cloud/CloudCoreVersion.cs
+
+# Run SDK unit tests
+RUN --mount=type=cache,id=nuget-cache,target=/root/.nuget/packages \
+    /bin/sh /build/$SDK_ROOT/Scripts/Dockerfile/build-dotnet-base/run_dotnet_unit_tests.sh
+
+## Build server & botclient
+# \note Set PublishDocumentationFiles=false because we set GenerateDocumentationFile=true in the SDK's .csproj files only for the purpose of getting warnings about broken XML docs. We're not currently interested in the generated XML documentation files.
+# \note Ideally we'd like to set this property in the SDK's .csproj files but that didn't seem to work.
+RUN --mount=type=cache,id=nuget-cache,target=/root/.nuget/packages \
+    dotnet publish /build/$PROJECT_ROOT/$BACKEND_DIR/Server --framework net${DOTNET_VERSION} -c Release -o /build/out/gameserver --self-contained false /p:PublishDocumentationFiles=false
+RUN --mount=type=cache,id=nuget-cache,target=/root/.nuget/packages \
+    dotnet publish /build/$PROJECT_ROOT/$BACKEND_DIR/BotClient --framework net${DOTNET_VERSION} -c Release -o /build/out/botclient --self-contained false /p:PublishDocumentationFiles=false
+
+## Copy runtime options into build output location
+RUN cp -pr /build/$PROJECT_ROOT/$BACKEND_DIR/Server/Config /build/out/gameserver/
+RUN cp -pr /build/$PROJECT_ROOT/$BACKEND_DIR/BotClient/Config /build/out/botclient/
+
+## Copy gameconfig for server
+COPY $SERVER_GAME_CONFIG_DIR /build/out/gameserver/GameConfig
+
+#----------------------------------------------------------------------
+# Generate serializer DLLs & Run server validation steps
+#----------------------------------------------------------------------
+
+# Use target dotnet version and host architecture to be able to run the build
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/aspnet:${DOTNET_VERSION} AS generate-dotnet
+
+COPY --from=build-dotnet /build/out /build
+WORKDIR /build/gameserver
+RUN dotnet Server.dll --MetaplayBakeForContainer
+RUN dotnet Server.dll --MetaplayValidateDatabaseModelChanges
+RUN dotnet Server.dll --MetaplayValidateRuntimeOptions Config/Options.*.yaml
+RUN dotnet Server.dll --MetaplayValidateGameConfig GameConfig/StaticGameConfig.mpa
+WORKDIR /build/botclient
+RUN dotnet BotClient.dll --MetaplayBakeForContainer
+RUN dotnet BotClient.dll --MetaplayValidateRuntimeOptions Config/Options.*.yaml
+
+#----------------------------------------------------------------------
+# Build dashboard
+#----------------------------------------------------------------------
+
+FROM node:20-bullseye-slim AS build-dashboard
+ARG SDK_ROOT
+ARG PROJECT_ROOT
+ARG BACKEND_DIR
+ARG DASHBOARD_DIR
+ARG PNPM_ROOT
+ARG RUN_TESTS
+
+ENV PNPM_ROOT=$PNPM_ROOT
+ENV RUN_TESTS=$RUN_TESTS
+
+# Copy build scripts
+COPY $SDK_ROOT/Scripts/Dockerfile/build-dashboard /build/$SDK_ROOT/Scripts/Dockerfile/build-dashboard
+
+# Install build tools
+RUN /bin/sh /build/$SDK_ROOT/Scripts/Dockerfile/build-dashboard/install_build_tools.sh
+
+# Copy pnpm files
+COPY $PNPM_ROOT/pnpm-*.yaml /build/$PNPM_ROOT/
+
+# Copy all dashboard modules
+COPY $SDK_ROOT/Frontend /build/$SDK_ROOT/Frontend
+
+# Copy the selected dashboard project
+COPY $PROJECT_ROOT/$DASHBOARD_DIR /build/$PROJECT_ROOT/$DASHBOARD_DIR
+
+# Install dashboard deps (including Cypress)
+# Note: We're caching both the pnpm store and Cypress install caches to speed up
+# local builds. They could be cached in the CI builds between runs but that does
+# not happen by default.
+WORKDIR /build/$PNPM_ROOT/
+RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
+    --mount=type=cache,id=cypress-cache,sharing=locked,target=/root/.cache/Cypress \
+    /bin/sh /build/$SDK_ROOT/Scripts/Dockerfile/build-dashboard/pnpm_install.sh
+
+# Use /cypress-cache as the cache directory for any subsequent steps. We only set
+# this here so the installation itself uses the default directory (inside the docker
+# cache mount) but subsequent steps won't see the mount so we need a copy (done in the
+# previous step).
+ENV CYPRESS_CACHE_FOLDER=/cypress-cache
+
+WORKDIR /build/$PROJECT_ROOT/$DASHBOARD_DIR
+
+# If running in integration tests, run Cypress verify to avoid timeout issues when running the tests
+# \note Doesn't seem to be required anymore but keeping here for easy reference in case timeouts re-surface
+# RUN if [ "$RUN_TESTS" != "0" ]; then \
+#       npx cypress verify; \
+#     fi
+
+# Run dashboard linter
+RUN pnpm eslint . --fix
+
+# Run dashboard type checking
+RUN pnpm vue-tsc --noEmit
+
+# Run dashboard unit tests
+RUN pnpm vitest run
+
+# Run dashboard build
+RUN pnpm vite build
+
+#----------------------------------------------------------------------
+# Generate runtime image
+#----------------------------------------------------------------------
+
+# Available versions in: https://hub.docker.com/_/microsoft-dotnet-aspnet
+# \note Use matching runtime image as the project's TargetFramework
+FROM --platform=$TARGETPLATFORM mcr.microsoft.com/dotnet/aspnet:${DOTNET_VERSION} AS runtime
+ARG SDK_ROOT
+ARG PROJECT_ROOT
+ARG BACKEND_DIR
+ARG DASHBOARD_DIR
+ARG SERVER_SECRETS_DIR
+ARG SDK_ROOT
+
+# Ports: 80 (dashboard/admin api), 6000 (node remoting), 9090 (Prometheus metrics), 9339 (clients)
+EXPOSE 80 6000 9090 9339
+
+# Upgrade the distro packages & install some useful tools
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y -q --no-install-recommends wget && \
+    apt-get clean && \
+    rm -r /var/lib/apt/lists/*
+
+# Copy diagnostics tools
+COPY --from=build-dotnet /root/.dotnet/tools /usr/local/bin/
+
+# Copy dotnet build artifacts & generated DLLs
+COPY --from=generate-dotnet /build/ /
+
+# Copy secrets
+COPY $SERVER_SECRETS_DIR /gameserver/Secrets
+
+# Copy built dashboard (do this last as it takes the longest to build)
+COPY --from=build-dashboard /build/$PROJECT_ROOT/$DASHBOARD_DIR/dist /gameserver/wwwroot
+
+# Copy entrypoint.sh
+COPY $SDK_ROOT/Backend/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# By default, start gameserver
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["gameserver"]
