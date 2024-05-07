@@ -1,5 +1,5 @@
 # Rename this action to what you want, this is what shows in the left sidebar in Github Actions
-name: Build game server and deploy to develop environment
+name: Build game server and deploy to stable environment
 
 # Configure when this Github Action is triggered
 on:
@@ -9,7 +9,7 @@ on:
   # Trigger on all commits to branch 'main'
   # TODO: Replace this with your own desired trigger (see https://docs.github.com/en/actions/using-workflows/triggering-a-workflow)
   push:
-    branches: develop
+    branches: master
 
 jobs:
   # Build the server and deploy into the cloud
@@ -17,13 +17,13 @@ jobs:
     # Use Metaplay's reusable workflow
     uses: metaplay-shared/github-workflows/.github/workflows/build-deploy-server.yaml@v0
     secrets:
-      # Set this secret in your Github settings page to contain the machine user credentials that has access to the develop environment
+      # Set this secret in your Github settings page to contain the machine user credentials that has access to the stable environment
       METAPLAY_CREDENTIALS: ${{ secrets.METAPLAY_CREDENTIALS }}
     with:
       # Pre-filled values based on your project and latest version of Helm chart at the time of creation
       organization: interview14
       project: project14
-      environment: develop
+      environment: stable
       project-root: . # assume project is in the repository root
       helm-chart-version: "0.5.3" # you should occasionally upgrade to the latest version
-      deployment-values-file: "Backend/Deployments/develop-server.yaml"
+      deployment-values-file: "Backend/Deployments/stable-server.yaml"
